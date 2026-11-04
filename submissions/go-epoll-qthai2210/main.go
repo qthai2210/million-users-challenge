@@ -2,15 +2,11 @@
 package main
 
 import (
-	"context"
-	"encoding/json"
 	"log"
 	"net"
 	"os"
 	"strconv"
 	"time"
-
-	"github.com/jackc/pgx/v5/pgconn"
 )
 
 type config struct {
@@ -52,55 +48,14 @@ func loadConfig() config {
 	return c
 }
 
-// app holds what handlers share. Only connections and process start time live here: nothing derived from requests or
-// data (rule 7).
-type app struct {
-	cfg     config
-	started time.Time
-	db      *pgconn.PgConn // P1: one synchronous connection, used by /health only
-}
-
-func (a *app) handle(r *request, out []byte) []byte {
-	if string(r.method) == "GET" && string(r.path) == "/health" {
-		return a.health(r, out)
-	}
-	return appendJSON(out, 404, `{"error":"not found"}`, r.keepAlive)
-}
-
-func (a *app) health(r *request, out []byte) []byte {
-	if err := a.ping(); err != nil {
-		msg, _ := json.Marshal(err.Error())
-		return appendJSON(out, 503, `{"status":"degraded","db":"unreachable","error":`+string(msg)+`}`, r.keepAlive)
-	}
-	uptime := strconv.FormatInt(int64(time.Since(a.started)/time.Second), 10)
-	return appendJSON(out, 200, `{"status":"ok","db":"ok","uptime_s":`+uptime+`}`, r.keepAlive)
-}
-
-func (a *app) ping() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	if a.db == nil || a.db.IsClosed() {
-		db, err := pgconn.Connect(ctx, a.cfg.databaseURL)
-		if err != nil {
-			return err
-		}
-		a.db = db
-	}
-	if _, err := a.db.Exec(ctx, "SELECT 1").ReadAll(); err != nil {
-		a.db.Close(context.Background())
-		a.db = nil
-		return err
-	}
-	return nil
-}
-
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-	a := &app{cfg: loadConfig(), started: time.Now()}
-	l, err := newLoop(a.cfg.host, a.cfg.ports, a.handle)
+	cfg := loadConfig()
+	a := &app{started: time.Now(), db: &db{url: cfg.databaseURL}, jwt: newJWTVerifier(cfg.jwtSecret)}
+	l, err := newLoop(cfg.host, cfg.ports, a.handle)
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("listening on %s ports %v", a.cfg.host, a.cfg.ports)
+	log.Printf("listening on %s ports %v", cfg.host, cfg.ports)
 	l.run()
 }

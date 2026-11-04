@@ -11,10 +11,11 @@ import (
 
 // conn is the per-connection state. P1 keeps it in a map; P4 moves it to an off-heap slot table indexed by fd.
 type conn struct {
-	in       []byte // received bytes not yet parsed
-	out      []byte // response bytes not yet written
-	close    bool   // close once out is flushed
-	outArmed bool   // EPOLLOUT is registered (out did not fit in the socket buffer)
+	in        []byte // received bytes not yet parsed
+	out       []byte // response bytes not yet written
+	close     bool   // close once out is flushed
+	outArmed  bool   // EPOLLOUT is registered (out did not fit in the socket buffer)
+	continued bool   // "100 Continue" already sent for the request being received
 }
 
 // loop is one epoll event loop on one locked OS thread. P1 runs a single loop; P3 runs one per core.
@@ -135,8 +136,13 @@ func (l *loop) process(c *conn) {
 	for off < len(c.in) {
 		used := parseRequest(c.in[off:], &r)
 		if used == 0 {
+			if r.needContinue && !c.continued {
+				c.out = append(c.out, "HTTP/1.1 100 Continue\r\n\r\n"...)
+				c.continued = true
+			}
 			break
 		}
+		c.continued = false
 		if used < 0 {
 			c.out = appendJSON(c.out, 400, `{"error":"bad request"}`, false)
 			c.close = true
