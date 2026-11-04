@@ -5,6 +5,7 @@ import (
 	"log"
 	"net"
 	"runtime"
+	"sync/atomic"
 
 	"golang.org/x/sys/unix"
 )
@@ -18,21 +19,28 @@ type conn struct {
 	continued bool   // "100 Continue" already sent for the request being received
 }
 
-// loop is one epoll event loop on one locked OS thread. P1 runs a single loop; P3 runs one per core.
+// loop is one epoll event loop on one locked OS thread, with its own SO_REUSEPORT listeners on every port: the
+// kernel spreads new connections over the loops, and a connection stays on the loop that accepted it.
 type loop struct {
+	id        int
 	epfd      int
 	listeners map[int]bool
 	conns     map[int]*conn
 	handle    func(*request, []byte) []byte
 	rbuf      []byte
+	nconns    atomic.Int64 // open client connections, read by the stats logger
 }
 
-func newLoop(host net.IP, ports []int, handle func(*request, []byte) []byte) (*loop, error) {
+// loopCount is one loop per CPU this process may run on. runtime.NumCPU follows the affinity mask (taskset,
+// cpusets), not the machine's core count, which is what the 8- and 4-core runs restrict.
+func loopCount() int { return runtime.NumCPU() }
+
+func newLoop(id int, host net.IP, ports []int, handle func(*request, []byte) []byte) (*loop, error) {
 	epfd, err := unix.EpollCreate1(unix.EPOLL_CLOEXEC)
 	if err != nil {
 		return nil, fmt.Errorf("epoll_create1: %w", err)
 	}
-	l := &loop{epfd: epfd, listeners: map[int]bool{}, conns: map[int]*conn{}, handle: handle, rbuf: make([]byte, 64<<10)}
+	l := &loop{id: id, epfd: epfd, listeners: map[int]bool{}, conns: map[int]*conn{}, handle: handle, rbuf: make([]byte, 64<<10)}
 	for _, p := range ports {
 		fd, err := listen(host, p)
 		if err != nil {
@@ -106,6 +114,7 @@ func (l *loop) accept(lfd int) {
 			continue
 		}
 		l.conns[fd] = &conn{}
+		l.nconns.Add(1)
 	}
 }
 
@@ -195,5 +204,6 @@ func (l *loop) closeConn(fd int) {
 		return
 	}
 	delete(l.conns, fd)
+	l.nconns.Add(-1)
 	unix.Close(fd) // also removes fd from the epoll set
 }

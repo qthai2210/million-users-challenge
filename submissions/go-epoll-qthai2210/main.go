@@ -2,6 +2,7 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"net"
 	"os"
@@ -51,11 +52,36 @@ func loadConfig() config {
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	cfg := loadConfig()
-	a := &app{started: time.Now(), db: &db{url: cfg.databaseURL}, jwt: newJWTVerifier(cfg.jwtSecret)}
-	l, err := newLoop(cfg.host, cfg.ports, a.handle)
-	if err != nil {
-		log.Fatal(err)
+	started := time.Now()
+	loops := make([]*loop, loopCount())
+	for i := range loops {
+		// Everything a handler touches is per loop (scratch buffer, HMAC, database connection), so loops share nothing.
+		a := &app{started: started, db: &db{url: cfg.databaseURL}, jwt: newJWTVerifier(cfg.jwtSecret)}
+		l, err := newLoop(i, cfg.host, cfg.ports, a.handle)
+		if err != nil {
+			log.Fatal(err)
+		}
+		loops[i] = l
 	}
-	log.Printf("listening on %s ports %v", cfg.host, cfg.ports)
-	l.run()
+	log.Printf("listening on %s ports %v with %d loops", cfg.host, cfg.ports, len(loops))
+	go logStats(loops)
+	for _, l := range loops[1:] {
+		go l.run()
+	}
+	loops[0].run()
+}
+
+// logStats prints the open connections per loop every 10 s, when they changed.
+func logStats(loops []*loop) {
+	counts := make([]int64, len(loops))
+	last := ""
+	for range time.Tick(10 * time.Second) {
+		for i, l := range loops {
+			counts[i] = l.nconns.Load()
+		}
+		if line := fmt.Sprint(counts); line != last {
+			log.Printf("connections per loop: %s", line)
+			last = line
+		}
+	}
 }
