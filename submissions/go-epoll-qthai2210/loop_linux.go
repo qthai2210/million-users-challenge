@@ -179,7 +179,7 @@ func (l *loop) run() {
 		if batchWindow > 0 && n > 0 && n < len(events) {
 			if rest := batchWindow - time.Since(l.now); rest > 0 {
 				ts := unix.NsecToTimespec(int64(rest))
-				unix.Nanosleep(&ts, nil)
+				rawSleep(&ts)
 			}
 		}
 	}
@@ -251,7 +251,7 @@ func (l *loop) accept(lfd int) {
 }
 
 func (l *loop) read(c *conn) {
-	n, err := unix.Read(c.fd, l.rbuf)
+	n, err := rawRead(c.fd, l.rbuf)
 	if err == unix.EAGAIN {
 		return
 	}
@@ -318,7 +318,7 @@ func (l *loop) flush(c *conn) {
 		return
 	}
 	for len(c.out) > 0 {
-		n, err := unix.Write(c.fd, c.out)
+		n, err := rawWrite(c.fd, c.out)
 		if err == unix.EAGAIN {
 			if !c.outArmed {
 				c.outArmed = true

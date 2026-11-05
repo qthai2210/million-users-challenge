@@ -154,7 +154,7 @@ func (l *loop) noConnection(ops []*op) bool {
 
 func (l *loop) flushDB(d *dbConn) {
 	for len(d.out) > 0 {
-		n, err := unix.Write(d.fd, d.out)
+		n, err := rawWrite(d.fd, d.out)
 		if err == unix.EAGAIN {
 			if !d.outArmed {
 				d.outArmed = true
@@ -176,7 +176,7 @@ func (l *loop) flushDB(d *dbConn) {
 }
 
 func (l *loop) readDB(d *dbConn) {
-	n, err := unix.Read(d.fd, l.rbuf)
+	n, err := rawRead(d.fd, l.rbuf)
 	if err == unix.EAGAIN {
 		return
 	}
