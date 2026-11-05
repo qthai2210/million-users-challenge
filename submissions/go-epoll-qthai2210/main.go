@@ -83,6 +83,7 @@ func main() {
 	}
 	log.Printf("listening on %s ports %v with %d loops", cfg.host, cfg.ports, len(loops))
 	go logStats(loops)
+	go keepDate()
 	for _, l := range loops[1:] {
 		go l.run()
 	}

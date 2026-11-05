@@ -296,7 +296,7 @@ func (l *loop) process(c *conn) {
 		c.out = out
 		off += used
 		if o != nil {
-			o.c, o.keepAlive = c, r.keepAlive
+			o.c, o.keepAlive, o.gzip = c, r.keepAlive, r.gzip
 			c.waiting = true
 			l.enqueue(o)
 		}

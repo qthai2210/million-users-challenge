@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"strconv"
+	"sync/atomic"
+	"time"
 )
 
 // maxHead caps the request line plus headers; a request still incomplete past this is malformed. maxBody caps
@@ -19,6 +21,7 @@ type request struct {
 	body      []byte
 	auth      []byte // Authorization header value
 	keepAlive bool
+	gzip      bool // Accept-Encoding mentions gzip
 	// needContinue: the head is complete, the body is not, and the client sent "Expect: 100-continue".
 	needContinue bool
 }
@@ -71,6 +74,8 @@ func parseRequest(b []byte, r *request) int {
 			}
 		case bytes.EqualFold(name, []byte("Authorization")):
 			r.auth = value
+		case bytes.EqualFold(name, []byte("Accept-Encoding")):
+			r.gzip = bytes.Contains(value, []byte("gzip"))
 		case bytes.EqualFold(name, []byte("Expect")):
 			expectContinue = bytes.EqualFold(value, []byte("100-continue"))
 		}
@@ -89,13 +94,40 @@ var statusText = map[int]string{
 	500: "Internal Server Error", 503: "Service Unavailable",
 }
 
+// dateHeader is the current "Date: ...\r\n" header line, rebuilt once a second by keepDate.
+var dateHeader atomic.Pointer[[]byte]
+
+func init() { setDate(time.Now()) }
+
+func setDate(t time.Time) {
+	b := t.UTC().AppendFormat([]byte("Date: "), "Mon, 02 Jan 2006 15:04:05 GMT")
+	b = append(b, "\r\n"...)
+	dateHeader.Store(&b)
+}
+
+func keepDate() {
+	for t := range time.Tick(time.Second) {
+		setDate(t)
+	}
+}
+
 // appendJSON appends a complete response with a JSON body to out.
 func appendJSON[T string | []byte](out []byte, status int, body T, keepAlive bool) []byte {
+	return appendResponse(out, status, body, keepAlive, false)
+}
+
+// appendResponse appends a complete response; gzipped says body is already gzip-compressed JSON.
+func appendResponse[T string | []byte](out []byte, status int, body T, keepAlive, gzipped bool) []byte {
 	out = append(out, "HTTP/1.1 "...)
 	out = strconv.AppendInt(out, int64(status), 10)
 	out = append(out, ' ')
 	out = append(out, statusText[status]...)
-	out = append(out, "\r\nContent-Type: application/json\r\nContent-Length: "...)
+	out = append(out, "\r\n"...)
+	out = append(out, *dateHeader.Load()...)
+	if gzipped {
+		out = append(out, "Content-Encoding: gzip\r\n"...)
+	}
+	out = append(out, "Content-Type: application/json\r\nContent-Length: "...)
 	out = strconv.AppendInt(out, int64(len(body)), 10)
 	if !keepAlive {
 		out = append(out, "\r\nConnection: close"...)

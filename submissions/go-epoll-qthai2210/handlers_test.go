@@ -1,8 +1,12 @@
 package main
 
 import (
+	stdgzip "compress/gzip"
+	"io"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // Routing, auth, id and body validation happen before Postgres: those requests are answered at once, and the rest
@@ -51,5 +55,44 @@ func TestRouteWithoutDatabase(t *testing.T) {
 		if got != tc.want {
 			t.Errorf("%s %s: got %s, want %s", tc.method, tc.path, got, tc.want)
 		}
+	}
+}
+
+// A gzipped feed must decompress, with the standard library, to exactly the plain answer's body.
+func TestGzipFeed(t *testing.T) {
+	a := &app{started: time.Now(), jwt: newJWTVerifier([]byte(testSecret))}
+	answer := func(gz bool) (string, string) {
+		o := a.newOp(opFeed, stmtFeed)
+		o.keepAlive, o.gzip = true, gz
+		for i := int64(0); i < 20; i++ {
+			a.row(o, benchRow(500000-i))
+		}
+		res := string(a.finish(o, nil))
+		a.freeOp(o)
+		head, body, _ := strings.Cut(res, "\r\n\r\n")
+		return head, body
+	}
+	plainHead, plain := answer(false)
+	gzHead, gz := answer(true)
+	if strings.Contains(plainHead, "Content-Encoding") || !strings.Contains(gzHead, "Content-Encoding: gzip") {
+		t.Fatalf("headers:\n%s\n%s", plainHead, gzHead)
+	}
+	if !strings.Contains(gzHead, "Content-Length: "+strconv.Itoa(len(gz))) || !strings.Contains(gzHead, "\r\nDate: ") {
+		t.Fatalf("gzip head: %s", gzHead)
+	}
+	zr, err := stdgzip.NewReader(strings.NewReader(gz))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(zr)
+	if err != nil || string(got) != plain {
+		t.Fatalf("decompressed %d bytes (err %v), plain is %d bytes", len(got), err, len(plain))
+	}
+	t.Logf("feed: %d bytes plain, %d gzipped", len(plain), len(gz))
+	// Small answers stay plain even when gzip is accepted.
+	o := a.newOp(opHealth, stmtHealth)
+	o.keepAlive, o.gzip = true, true
+	if res := string(a.finish(o, nil)); strings.Contains(res, "Content-Encoding") {
+		t.Fatalf("health was gzipped: %q", res)
 	}
 }

@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/klauspost/compress/gzip"
 )
 
 // app holds what handlers share within one loop. Only the HMAC key, a scratch buffer and the process start time
@@ -16,6 +18,35 @@ type app struct {
 	jwt     *jwtVerifier
 	body    []byte // scratch buffer for the response body, reused by every response of the loop
 	free    []*op  // answered ops, reused: one op is made per request that needs Postgres
+	gz      *gzip.Writer
+	gzOut   byteWriter
+}
+
+// gzipMin is the smallest body worth compressing: in practice the feed (~5 KB, ~2 KB gzipped). Smaller answers
+// cost more CPU to compress than the bytes they save.
+const gzipMin = 1024
+
+type byteWriter struct{ b []byte }
+
+func (w *byteWriter) Write(p []byte) (int, error) {
+	w.b = append(w.b, p...)
+	return len(p), nil
+}
+
+// appendBody appends a response, gzipped (fastest level, one reused compressor per loop) when the client accepts
+// it and the body is large enough.
+func (a *app) appendBody(out []byte, status int, body []byte, keepAlive, gz bool) []byte {
+	if !gz || len(body) < gzipMin {
+		return appendJSON(out, status, body, keepAlive)
+	}
+	if a.gz == nil {
+		a.gz, _ = gzip.NewWriterLevel(&a.gzOut, gzip.BestSpeed)
+	}
+	a.gzOut.b = a.gzOut.b[:0]
+	a.gz.Reset(&a.gzOut)
+	a.gz.Write(body)
+	a.gz.Close()
+	return appendResponse(out, status, a.gzOut.b, keepAlive, true)
 }
 
 const maxFreeOps = 4096
@@ -62,6 +93,7 @@ type op struct {
 	kind      opKind
 	c         *conn
 	keepAlive bool
+	gzip      bool // the client accepts a gzipped answer
 	stmt      string
 	params    [][]byte
 	formats   []int16
@@ -256,5 +288,5 @@ func (a *app) finish(o *op, out []byte) (res []byte) {
 		b = append(b, '}')
 	}
 	a.body = b
-	return appendJSON(out, status, b, ka)
+	return a.appendBody(out, status, b, ka, o.gzip)
 }
