@@ -52,16 +52,23 @@ func loadConfig() config {
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	cfg := loadConfig()
+	dbCfg, err := parseDBConfig(cfg.databaseURL)
+	if err != nil {
+		log.Fatalf("DATABASE_URL: %v", err)
+	}
 	started := time.Now()
 	loops := make([]*loop, loopCount())
 	for i := range loops {
-		// Everything a handler touches is per loop (scratch buffer, HMAC, database connection), so loops share nothing.
-		a := &app{started: started, db: &db{url: cfg.databaseURL}, jwt: newJWTVerifier(cfg.jwtSecret)}
-		l, err := newLoop(i, cfg.host, cfg.ports, a.handle)
+		// Everything a handler touches is per loop (scratch buffer, HMAC, Postgres connections), so loops share nothing.
+		a := &app{started: started, jwt: newJWTVerifier(cfg.jwtSecret)}
+		l, err := newLoop(i, cfg.host, cfg.ports, a)
 		if err != nil {
 			log.Fatal(err)
 		}
 		loops[i] = l
+		for _, role := range []dbRole{roleRead, roleWrite} {
+			go (&dbSlot{loop: l, role: role, lost: make(chan struct{}, 1)}).keep(dbCfg)
+		}
 	}
 	log.Printf("listening on %s ports %v with %d loops", cfg.host, cfg.ports, len(loops))
 	go logStats(loops)
