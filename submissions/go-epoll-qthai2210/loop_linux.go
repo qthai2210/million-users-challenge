@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -44,7 +45,12 @@ type loop struct {
 	pendWrite []*op
 	app       *app
 	rbuf      []byte
-	nconns    atomic.Int64 // open client connections, read by the stats logger
+	now       time.Time // start of the current pass
+
+	// read by the stats logger
+	nconns   atomic.Int64 // open client connections
+	answered atomic.Int64 // ops answered by Postgres
+	syncs    atomic.Int64 // batches (Syncs) answered
 
 	mu       sync.Mutex
 	incoming []handoff
@@ -132,7 +138,8 @@ func (l *loop) run() {
 	runtime.LockOSThread()
 	events := make([]unix.EpollEvent, 1024)
 	for {
-		n, err := unix.EpollWait(l.epfd, events, -1)
+		// Wake at least every second to time out ops waiting for a connection and connections that stopped answering.
+		n, err := unix.EpollWait(l.epfd, events, 1000)
 		if err != nil {
 			if err == unix.EINTR {
 				continue
@@ -151,6 +158,7 @@ func (l *loop) pass(events []unix.EpollEvent) {
 			log.Printf("loop %d: panic: %v", l.id, p)
 		}
 	}()
+	l.now = time.Now()
 	for _, ev := range events {
 		fd := int(ev.Fd)
 		switch {
@@ -181,6 +189,7 @@ func (l *loop) pass(events []unix.EpollEvent) {
 			}
 		}
 	}
+	l.checkSilent()
 	l.dispatch()
 }
 

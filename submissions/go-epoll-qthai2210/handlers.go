@@ -53,11 +53,16 @@ type op struct {
 	created  int64  // insert_post RETURNING created_at
 	errCode  string // SQLSTATE of an ErrorResponse, or codeNoConn / codeLost
 	errMsg   string
+
+	since   time.Time // first queued, for the wait for a connection
+	tries   int       // times sent
+	syncEnd int64     // stream offset, on its connection, of the end of its batch's Sync
+	single  bool      // send under its own Sync (its batch failed once)
 }
 
 func (o *op) write() bool { return o.kind == opCreate || o.kind == opLike }
 
-// reset clears the results before the op is sent again.
+// reset clears the results before the op is sent again (since, tries and single stay).
 func (o *op) reset() {
 	o.body, o.rows, o.affected, o.id, o.created, o.errCode, o.errMsg = o.body[:0], 0, 0, 0, 0, "", ""
 }

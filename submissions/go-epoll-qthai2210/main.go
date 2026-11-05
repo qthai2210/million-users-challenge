@@ -66,8 +66,10 @@ func main() {
 			log.Fatal(err)
 		}
 		loops[i] = l
-		for _, role := range []dbRole{roleRead, roleWrite} {
-			go (&dbSlot{loop: l, role: role, lost: make(chan struct{}, 1)}).keep(dbCfg)
+		for role, total := range [...]int{roleRead: dbReadConns, roleWrite: dbWriteConns} {
+			for range share(total, len(loops), i) {
+				go (&dbSlot{loop: l, role: dbRole(role), lost: make(chan struct{}, 1)}).keep(dbCfg)
+			}
 		}
 	}
 	log.Printf("listening on %s ports %v with %d loops", cfg.host, cfg.ports, len(loops))
@@ -78,17 +80,43 @@ func main() {
 	loops[0].run()
 }
 
-// logStats prints the open connections per loop every 10 s, when they changed.
+// Postgres connections in total, whatever the number of loops: the database box has 16 cores either way. Reads and
+// writes are apart so a read never waits behind a commit. 80 of the 512 allowed (rule 5).
+const (
+	dbReadConns  = 64
+	dbWriteConns = 16
+)
+
+// share is loop i's part of total connections spread over n loops, at least 1.
+func share(total, n, i int) int {
+	k := total / n
+	if i < total%n {
+		k++
+	}
+	return max(k, 1)
+}
+
+// logStats prints, every 10 s when something changed, the open client connections per loop and the Postgres
+// answers per second and per Sync.
 func logStats(loops []*loop) {
 	counts := make([]int64, len(loops))
+	var lastAnswered, lastSyncs int64
 	last := ""
 	for range time.Tick(10 * time.Second) {
+		var answered, syncs int64
 		for i, l := range loops {
 			counts[i] = l.nconns.Load()
+			answered += l.answered.Load()
+			syncs += l.syncs.Load()
 		}
-		if line := fmt.Sprint(counts); line != last {
-			log.Printf("connections per loop: %s", line)
+		line := fmt.Sprintf("connections per loop: %v", counts)
+		if da, ds := answered-lastAnswered, syncs-lastSyncs; ds > 0 {
+			line += fmt.Sprintf(", postgres: %d answers/s, %.1f per Sync", da/10, float64(da)/float64(ds))
+		}
+		if line != last {
+			log.Print(line)
 			last = line
 		}
+		lastAnswered, lastSyncs = answered, syncs
 	}
 }
