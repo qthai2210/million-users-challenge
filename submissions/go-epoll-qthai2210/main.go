@@ -52,6 +52,13 @@ func loadConfig() config {
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	cfg := loadConfig()
+	if v := os.Getenv("BATCH_WINDOW_US"); v != "" { // tuning knob for measurements; the default is what was measured best
+		us, err := strconv.Atoi(v)
+		if err != nil || us < 0 {
+			log.Fatalf("BATCH_WINDOW_US %q is not a number of microseconds", v)
+		}
+		batchWindow = time.Duration(us) * time.Microsecond
+	}
 	dbCfg, err := parseDBConfig(cfg.databaseURL)
 	if err != nil {
 		log.Fatalf("DATABASE_URL: %v", err)
@@ -79,6 +86,9 @@ func main() {
 	}
 	loops[0].run()
 }
+
+// batchWindow is the shortest time between the starts of two loop passes that found work.
+var batchWindow = time.Millisecond
 
 // Postgres connections in total, whatever the number of loops: the database box has 16 cores either way. Reads and
 // writes are apart so a read never waits behind a commit. 80 of the 512 allowed (rule 5).

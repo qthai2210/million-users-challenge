@@ -46,6 +46,7 @@ type loop struct {
 	app       *app
 	rbuf      []byte
 	now       time.Time // start of the current pass
+	checked   time.Time // last checkSilent
 
 	// read by the stats logger
 	nconns   atomic.Int64 // open client connections
@@ -147,6 +148,15 @@ func (l *loop) run() {
 			log.Fatalf("epoll_wait: %v", err)
 		}
 		l.pass(events[:n])
+		// Batching window: a pass that found work starts at most every batchWindow, so requests and Postgres answers
+		// pile up and share the next pass's syscalls and Syncs. A pass that took the whole window, or didn't get every
+		// ready event, doesn't wait.
+		if batchWindow > 0 && n > 0 && n < len(events) {
+			if rest := batchWindow - time.Since(l.now); rest > 0 {
+				ts := unix.NsecToTimespec(int64(rest))
+				unix.Nanosleep(&ts, nil)
+			}
+		}
 	}
 }
 
@@ -189,7 +199,10 @@ func (l *loop) pass(events []unix.EpollEvent) {
 			}
 		}
 	}
-	l.checkSilent()
+	if l.now.Sub(l.checked) >= time.Second {
+		l.checked = l.now
+		l.checkSilent()
+	}
 	l.dispatch()
 }
 
