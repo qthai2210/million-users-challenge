@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"math/rand/v2"
 	"strings"
 	"testing"
 	"time"
@@ -29,6 +30,26 @@ func TestAppendTimestamp(t *testing.T) {
 		}
 		if got := string(appendTimestamp(nil, usSince2000(tm))); got != tc.want {
 			t.Errorf("%s: got %s, want %s", tc.in, got, tc.want)
+		}
+	}
+}
+
+// The hand-written date arithmetic must agree with the time package on any instant from 1970 to 2200.
+func TestAppendTimestampMatchesTimePackage(t *testing.T) {
+	r := rand.New(rand.NewPCG(1, 2))
+	lo, hi := time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC).UnixMicro(), time.Date(2200, 1, 1, 0, 0, 0, 0, time.UTC).UnixMicro()
+	edges := []int64{lo, hi - 1, time.Date(2000, 2, 29, 23, 59, 59, 999999000, time.UTC).UnixMicro(),
+		time.Date(2100, 3, 1, 0, 0, 0, 0, time.UTC).UnixMicro(), time.Date(2024, 12, 31, 23, 59, 59, 999999000, time.UTC).UnixMicro()}
+	for i := 0; i < 1_000_000; i++ {
+		var unixUs int64
+		if i < len(edges) {
+			unixUs = edges[i]
+		} else {
+			unixUs = lo + r.Int64N(hi-lo)
+		}
+		want := `"` + time.UnixMicro(unixUs).UTC().Truncate(time.Millisecond).Format("2006-01-02T15:04:05.000Z") + `"`
+		if got := string(appendTimestamp(nil, unixUs-pgEpochMs*1000)); got != want {
+			t.Fatalf("unix µs %d: got %s, want %s", unixUs, got, want)
 		}
 	}
 }

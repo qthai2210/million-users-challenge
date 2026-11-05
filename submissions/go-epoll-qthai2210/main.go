@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"runtime/debug"
 	"strconv"
 	"time"
 )
@@ -52,6 +53,7 @@ func loadConfig() config {
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	cfg := loadConfig()
+	tuneGC()
 	if v := os.Getenv("BATCH_WINDOW_US"); v != "" { // tuning knob for measurements; the default is what was measured best
 		us, err := strconv.Atoi(v)
 		if err != nil || us < 0 {
@@ -85,6 +87,19 @@ func main() {
 		go l.run()
 	}
 	loops[0].run()
+}
+
+// tuneGC sets the collector in the process (rule 13 allows it). The live heap is small (connection buffers go back
+// to the loops' pools), so the GC may let it grow 5x before collecting; the soft limit at 75% of RAM keeps that from
+// ever crowding out the kernel's socket memory.
+func tuneGC() {
+	debug.SetGCPercent(400)
+	if b, err := os.ReadFile("/proc/meminfo"); err == nil {
+		var kb int64
+		if _, err := fmt.Sscanf(string(b), "MemTotal: %d kB", &kb); err == nil && kb > 0 {
+			debug.SetMemoryLimit(kb * 1024 * 3 / 4)
+		}
+	}
 }
 
 // batchWindow is the shortest time between the starts of two loop passes that found work.

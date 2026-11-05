@@ -2,7 +2,6 @@ package main
 
 import (
 	"strconv"
-	"time"
 )
 
 // pgEpochMs is 2000-01-01T00:00:00Z in unix milliseconds: binary timestamptz counts microseconds from there.
@@ -48,13 +47,50 @@ func appendJSONString[T string | []byte](dst []byte, s T) []byte {
 // appendTimestamp appends a binary timestamptz (microseconds since 2000-01-01 UTC) as a quoted UTC string with
 // milliseconds, truncated (not rounded): "2025-12-31T23:59:19.409Z".
 func appendTimestamp(dst []byte, us int64) []byte {
-	ms := us / 1000
-	if us%1000 < 0 { // floor for instants before 2000
-		ms--
-	}
+	ms := floorDiv(us, 1000) + pgEpochMs // unix milliseconds
+	days := floorDiv(ms, 86400000)
+	rem := ms - days*86400000
+	y, m, d := civil(days)
 	dst = append(dst, '"')
-	dst = time.UnixMilli(pgEpochMs+ms).UTC().AppendFormat(dst, "2006-01-02T15:04:05.000Z")
+	dst = append4(dst, y)
+	dst = append(dst, '-', byte('0'+m/10), byte('0'+m%10), '-', byte('0'+d/10), byte('0'+d%10), 'T')
+	h, mi, s, f := rem/3600000, rem/60000%60, rem/1000%60, rem%1000
+	dst = append(dst, byte('0'+h/10), byte('0'+h%10), ':', byte('0'+mi/10), byte('0'+mi%10), ':', byte('0'+s/10), byte('0'+s%10),
+		'.', byte('0'+f/100), byte('0'+f/10%10), byte('0'+f%10), 'Z')
 	return append(dst, '"')
+}
+
+func floorDiv(a, b int64) int64 {
+	q := a / b
+	if a%b < 0 {
+		q--
+	}
+	return q
+}
+
+// civil converts days since 1970-01-01 to a proleptic Gregorian date (Howard Hinnant's days_from_civil, inverted).
+func civil(days int64) (y, m, d int64) {
+	z := days + 719468
+	era := floorDiv(z, 146097)
+	doe := z - era*146097
+	yoe := (doe - doe/1460 + doe/36524 - doe/146096) / 365
+	doy := doe - (365*yoe + yoe/4 - yoe/100)
+	mp := (5*doy + 2) / 153
+	d = doy - (153*mp+2)/5 + 1
+	m = mp + 3
+	if m > 12 {
+		m -= 12
+	}
+	y = yoe + era*400
+	if m <= 2 {
+		y++
+	}
+	return y, m, d
+}
+
+// append4 appends a year as four digits (0000-9999).
+func append4(dst []byte, y int64) []byte {
+	return append(dst, byte('0'+y/1000%10), byte('0'+y/100%10), byte('0'+y/10%10), byte('0'+y%10))
 }
 
 // appendPost appends a post object with keys in the spec's order.
