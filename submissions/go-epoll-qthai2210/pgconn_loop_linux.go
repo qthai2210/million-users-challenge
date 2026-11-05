@@ -59,15 +59,17 @@ func (l *loop) enqueue(o *op) {
 	}
 }
 
-// retry queues an op again after its connection failed or its batch was rolled back, unless it was tried too often.
-func (l *loop) retry(o *op, single bool, why string) {
-	if o.tries >= maxTries {
+// retry queues an op again after its batch was rolled back (rolledBack: it goes alone next time, at most maxTries
+// sends) or its connection was lost (it may wait for another one for up to noConnWait since it was first queued, so a
+// burst of lost connections doesn't fail reads that a new connection can still answer).
+func (l *loop) retry(o *op, rolledBack bool, why string) {
+	if (rolledBack && o.tries >= maxTries) || l.now.Sub(o.since) > noConnWait {
 		o.errCode, o.errMsg = codeLost, why
 		l.complete(o)
 		return
 	}
 	o.reset()
-	o.single = o.single || single
+	o.single = o.single || rolledBack
 	l.enqueue(o)
 }
 

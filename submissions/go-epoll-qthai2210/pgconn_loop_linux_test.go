@@ -179,7 +179,8 @@ func TestLostConnection(t *testing.T) {
 	pu := testClient(t, l, unsentWrite)
 	l.enqueue(unsentWrite)
 	l.dispatch()
-	d.written -= 2 // pretend the last two bytes of the second Sync never left the process
+	d.written -= 2     // pretend the last two bytes of the second Sync never left the process
+	read.since = l.now // as enqueue would have set it
 	d.sent = append(d.sent, read)
 	pr := testClient(t, l, read)
 	drain(pg)
@@ -221,17 +222,43 @@ func TestNoConnection(t *testing.T) {
 	}
 }
 
+// A connection that stays silent for silentMax is dropped. Its op has by then waited longer than noConnWait, so it
+// gets a 500 rather than waiting more.
 func TestSilentConnection(t *testing.T) {
 	l := testLoop(t)
 	d, _ := testDB(t, l, roleRead)
 	o := &op{kind: opFeed, stmt: stmtFeed}
-	testClient(t, l, o)
+	p := testClient(t, l, o)
 	l.enqueue(o)
 	l.dispatch()
 	l.now = l.now.Add(silentMax + time.Second)
 	l.checkSilent()
-	if !d.closed || len(l.pendRead) != 1 {
-		t.Fatalf("closed=%v pendRead=%d", d.closed, len(l.pendRead))
+	if resp := drain(p); !d.closed || len(l.pendRead) != 0 || status(resp) != "500" {
+		t.Fatalf("closed=%v pendRead=%d response %q", d.closed, len(l.pendRead), resp)
+	}
+}
+
+// A read whose connection is lost is sent again, for up to noConnWait after it was first queued, however many
+// connections it went through.
+func TestLostReadRetriedWithinWait(t *testing.T) {
+	l := testLoop(t)
+	o := &op{kind: opFeed, stmt: stmtFeed}
+	p := testClient(t, l, o)
+	l.enqueue(o)
+	for i := 0; i < 5; i++ { // five lost connections in a row, well past maxTries sends
+		d, _ := testDB(t, l, roleRead)
+		l.dispatch()
+		l.closeDB(d, unix.ECONNRESET)
+		if len(l.pendRead) != 1 || drain(p) != "" {
+			t.Fatalf("loss %d: the read must still be queued", i+1)
+		}
+	}
+	l.now = l.now.Add(noConnWait + time.Second)
+	d, _ := testDB(t, l, roleRead)
+	l.dispatch()
+	l.closeDB(d, unix.ECONNRESET)
+	if resp := drain(p); status(resp) != "500" {
+		t.Fatalf("after noConnWait: %q", resp)
 	}
 }
 
