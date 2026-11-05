@@ -15,8 +15,8 @@ import (
 // conn is a client connection. P3 keeps it in a map; P4 moves it to an off-heap slot table indexed by fd.
 type conn struct {
 	fd        int
-	in        []byte // received bytes not yet parsed
-	out       []byte // response bytes not yet written
+	in        []byte // received bytes not yet parsed; nil (back in the loop's pool) when there are none
+	out       []byte // response bytes not yet written; nil when there are none
 	close     bool   // close once out is flushed
 	outArmed  bool   // EPOLLOUT is registered (out did not fit in the socket buffer)
 	continued bool   // "100 Continue" already sent for the request being received
@@ -45,6 +45,7 @@ type loop struct {
 	pendWrite []*op
 	app       *app
 	rbuf      []byte
+	bufs      [][]byte  // free connection buffers
 	now       time.Time // start of the current pass
 	checked   time.Time // last checkSilent
 
@@ -55,6 +56,30 @@ type loop struct {
 
 	mu       sync.Mutex
 	incoming []handoff
+}
+
+// Connection buffers come from a per-loop pool and go back as soon as they are empty, so an idle connection holds
+// none, whatever its last response was. Buffers that grew large are left to the GC.
+const (
+	bufSize      = 8 << 10
+	maxPooledBuf = 64 << 10
+	maxFreeBufs  = 1024
+)
+
+func (l *loop) getBuf() []byte {
+	if n := len(l.bufs); n > 0 {
+		b := l.bufs[n-1]
+		l.bufs = l.bufs[:n-1]
+		return b
+	}
+	return make([]byte, 0, bufSize)
+}
+
+func (l *loop) putBuf(b []byte) {
+	if cap(b) == 0 || cap(b) > maxPooledBuf || len(l.bufs) >= maxFreeBufs {
+		return
+	}
+	l.bufs = append(l.bufs, b[:0])
 }
 
 // loopCount is one loop per CPU this process may run on. runtime.NumCPU follows the affinity mask (taskset,
@@ -234,6 +259,9 @@ func (l *loop) read(c *conn) {
 		l.closeConn(c)
 		return
 	}
+	if c.in == nil {
+		c.in = l.getBuf()
+	}
 	c.in = append(c.in, l.rbuf[:n]...)
 	if !c.close {
 		l.process(c)
@@ -243,6 +271,9 @@ func (l *loop) read(c *conn) {
 
 // process answers the complete requests in c.in, in order (pipelining), until one has to wait for Postgres.
 func (l *loop) process(c *conn) {
+	if c.out == nil {
+		c.out = l.getBuf() // flush gives it back if nothing was written to it
+	}
 	off := 0
 	var r request
 	for off < len(c.in) && !c.waiting {
@@ -276,6 +307,10 @@ func (l *loop) process(c *conn) {
 		}
 	}
 	c.in = c.in[:copy(c.in, c.in[off:])]
+	if len(c.in) == 0 {
+		l.putBuf(c.in)
+		c.in = nil
+	}
 }
 
 func (l *loop) flush(c *conn) {
@@ -297,6 +332,10 @@ func (l *loop) flush(c *conn) {
 		}
 		c.out = c.out[:copy(c.out, c.out[n:])]
 	}
+	if c.out != nil {
+		l.putBuf(c.out)
+		c.out = nil
+	}
 	if c.close && !c.waiting {
 		l.closeConn(c)
 		return
@@ -314,6 +353,9 @@ func (l *loop) closeConn(c *conn) {
 		return
 	}
 	c.closed = true
+	l.putBuf(c.in)
+	l.putBuf(c.out)
+	c.in, c.out = nil, nil
 	delete(l.conns, c.fd)
 	l.nconns.Add(-1)
 	unix.Close(c.fd) // also removes fd from the epoll set

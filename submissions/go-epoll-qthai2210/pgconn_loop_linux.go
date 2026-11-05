@@ -314,11 +314,17 @@ func (l *loop) checkSilent() {
 // it had pipelined behind it.
 func (l *loop) complete(o *op) {
 	c := o.c
+	if !c.closed {
+		if c.out == nil {
+			c.out = l.getBuf()
+		}
+		c.out = l.app.finish(o, c.out)
+		c.waiting = false
+	}
+	l.app.freeOp(o)
 	if c.closed {
 		return
 	}
-	c.out = l.app.finish(o, c.out)
-	c.waiting = false
 	if !c.close {
 		l.process(c)
 	}

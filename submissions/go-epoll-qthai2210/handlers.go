@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"log"
 	"strconv"
@@ -14,6 +15,29 @@ type app struct {
 	started time.Time
 	jwt     *jwtVerifier
 	body    []byte // scratch buffer for the response body, reused by every response of the loop
+	free    []*op  // answered ops, reused: one op is made per request that needs Postgres
+}
+
+const maxFreeOps = 4096
+
+// newOp takes an op from the free list, or makes one.
+func (a *app) newOp(kind opKind, stmt string) *op {
+	var o *op
+	if n := len(a.free); n > 0 {
+		o, a.free = a.free[n-1], a.free[:n-1]
+	} else {
+		o = new(op)
+	}
+	o.kind, o.stmt = kind, stmt
+	return o
+}
+
+// freeOp returns an answered op to the free list, keeping its buffers.
+func (a *app) freeOp(o *op) {
+	*o = op{body: o.body[:0], textBuf: o.textBuf[:0]}
+	if len(a.free) < maxFreeOps {
+		a.free = append(a.free, o)
+	}
 }
 
 type opKind uint8
@@ -54,6 +78,10 @@ type op struct {
 	errCode  string // SQLSTATE of an ErrorResponse, or codeNoConn / codeLost
 	errMsg   string
 
+	ibuf    [2][8]byte // storage for binary int8 parameters
+	pbuf    [2][]byte  // params points here
+	textBuf []byte     // storage for the text parameter of insert_post
+
 	since   time.Time // first queued, for the wait for a connection
 	tries   int       // times sent
 	syncEnd int64     // stream offset, on its connection, of the end of its batch's Sync
@@ -61,6 +89,13 @@ type op struct {
 }
 
 func (o *op) write() bool { return o.kind == opCreate || o.kind == opLike }
+
+// setInt8 sets parameter i (and the ones before it stay) to a binary int8, without allocating.
+func (o *op) setInt8(i int, v int64) {
+	binary.BigEndian.PutUint64(o.ibuf[i][:], uint64(v))
+	o.pbuf[i] = o.ibuf[i][:]
+	o.params = o.pbuf[:i+1]
+}
 
 // reset clears the results before the op is sent again (since, tries and single stay).
 func (o *op) reset() {
@@ -84,9 +119,9 @@ func (a *app) route(r *request, out []byte) ([]byte, *op) {
 	path, method := string(r.path), string(r.method)
 	switch {
 	case path == "/health" && method == "GET":
-		return out, &op{kind: opHealth, stmt: stmtHealth}
+		return out, a.newOp(opHealth, stmtHealth)
 	case path == "/feed" && method == "GET":
-		return out, &op{kind: opFeed, stmt: stmtFeed}
+		return out, a.newOp(opFeed, stmtFeed)
 	case path == "/posts" && method == "POST":
 		return a.createPost(r, out)
 	case strings.HasPrefix(path, "/posts/"):
@@ -116,7 +151,10 @@ func (a *app) getPost(r *request, rawID string, out []byte) ([]byte, *op) {
 	if !ok {
 		return appendError(out, 400, "invalid post id", r.keepAlive), nil
 	}
-	return out, &op{kind: opPost, stmt: stmtPostByID, params: [][]byte{int8Param(id)}, formats: allBinary, postID: id}
+	o := a.newOp(opPost, stmtPostByID)
+	o.setInt8(0, id)
+	o.formats, o.postID = allBinary, id
+	return out, o
 }
 
 func (a *app) createPost(r *request, out []byte) ([]byte, *op) {
@@ -128,8 +166,13 @@ func (a *app) createPost(r *request, out []byte) ([]byte, *op) {
 	if msg != "" {
 		return appendError(out, 400, msg, r.keepAlive), nil
 	}
-	return out, &op{kind: opCreate, stmt: stmtInsertPost, params: [][]byte{int8Param(u.id), []byte(text)}, formats: idAndText,
-		user: u, text: text}
+	o := a.newOp(opCreate, stmtInsertPost)
+	o.setInt8(0, u.id)
+	o.textBuf = append(o.textBuf[:0], text...)
+	o.pbuf[1] = o.textBuf
+	o.params = o.pbuf[:2]
+	o.formats, o.user, o.text = idAndText, u, text
+	return out, o
 }
 
 func (a *app) likePost(r *request, rawID string, out []byte) ([]byte, *op) {
@@ -141,8 +184,11 @@ func (a *app) likePost(r *request, rawID string, out []byte) ([]byte, *op) {
 	if !ok {
 		return appendError(out, 400, "invalid post id", r.keepAlive), nil
 	}
-	return out, &op{kind: opLike, stmt: stmtInsertLike, params: [][]byte{int8Param(u.id), int8Param(postID)}, formats: allBinary,
-		user: u, postID: postID}
+	o := a.newOp(opLike, stmtInsertLike)
+	o.setInt8(0, u.id)
+	o.setInt8(1, postID)
+	o.formats, o.user, o.postID = allBinary, u, postID
+	return out, o
 }
 
 // row takes one DataRow of o's result (binary columns).
